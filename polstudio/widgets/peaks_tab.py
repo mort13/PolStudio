@@ -178,26 +178,24 @@ class PeaksTab(QWidget):
     def _drawPeak(self, plot, x, y, row, widthFraction):
         """Peak marker and width line; with a per-peak baseline also the baseline and the corrected trace."""
         pos = int(np.clip(row["pos"], 0, len(y) - 1))  # positional index into the trace (see PeakFinder.process)
-        baseline = lambda k: 0.0  # noqa: E731
         bl, br = row.get("baseline left", np.nan), row.get("baseline right", np.nan)
         # NaN = baseline off, 0/0 = the walk found no baseline
         if np.isfinite(bl) and np.isfinite(br) and not (bl == 0 and br == 0):
             bl, br = int(pos + bl), int(pos + br)
             if 0 <= bl < br < len(y):
                 slope = (y[br] - y[bl]) / (br - bl)
-                baseline = lambda k: y[bl] + slope * (np.asarray(k, dtype=float) - bl)  # noqa: E731
                 plot.plot([x[bl], x[br]], [y[bl], y[br]], pen=pg.mkPen(TOL["green"], width=1.5,
                                                                       style=Qt.PenStyle.DashLine))
                 plot.plot([x[bl], x[br]], [y[bl], y[br]], pen=None, symbol="t1", symbolSize=8,
                           symbolBrush=TOL["green"], symbolPen=None)
                 k = np.arange(bl, br + 1)
-                plot.plot(x[k], y[k] - baseline(k), pen=pg.mkPen(TOL["green"], width=1, style=Qt.PenStyle.DotLine))
-        # height is measured above the baseline: draw marker and width line on top of it
-        plot.plot([x[pos]], [baseline(pos) + row["height"]], pen=None, symbol="o", symbolSize=7,
+                plot.plot(x[k], y[k] - (y[bl] + slope * (k - bl)), pen=pg.mkPen(TOL["green"], width=1, style=Qt.PenStyle.DotLine))
+        # Marker and width line straight from the results: height and widths are measured on the
+        # baseline-corrected trace (dotted), so they sit on that trace, not on the raw one
+        plot.plot([x[pos]], [row["height"]], pen=None, symbol="o", symbolSize=7,
                   symbolBrush=TOL["purple"], symbolPen=None)
-        k0, k1 = pos + row["width left"], pos + row["width right"]
         h = row["height"] * widthFraction
-        plot.plot([x[0] + k0, x[0] + k1], [baseline(k0) + h, baseline(k1) + h],
+        plot.plot([x[pos] + row["width left"], x[pos] + row["width right"]], [h, h],
                   pen=pg.mkPen(TOL["purple"], width=2))
 
     def _addRegions(self, plot):
