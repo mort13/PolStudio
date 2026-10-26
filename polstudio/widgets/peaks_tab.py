@@ -5,6 +5,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
                              QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
+from ..session import DEFAULT_PEAK_PARAMS, PEAK_TOGGLES
 from .pandas_model import PandasModel, makeTableView
 from .params import ParamForm
 from .plot_grid import TOL, PlotGrid
@@ -16,9 +17,12 @@ PEAK_TOOLTIPS = {
     "distanceFactor": "Region around a found peak (in widths) excluded from the next search",
     "widthFraction": "Fraction of the height where the width is measured (0.5 = FWHM)",
     "symmetric": "Use symmetric widths",
-    "minWidth": "Minimum width (False = off)",
-    "slopeLength": "Samples over which the baseline slope is evaluated (False = no baseline)",
-    "maxSlope": "Maximum slope accepted as baseline",
+    "minWidth": "Make both widths equal to the narrower side",
+    "slopeLength": "Per-peak linear baseline: samples over which the slope is evaluated while walking "
+                   "outwards from the peak (tick to enable)",
+    "maxSlope": "Per-peak baseline: the walk stops where the slope over slopeLength samples is <= maxSlope",
+    "slopeStartHeight": "Per-peak baseline: start the walk where the trace falls below this fraction of the "
+                        "peak height (e.g. 0.5 = FWHM edges) instead of at the peak",
     "noiseRegion": "[start, stop] sample range used for the noise amplitude (drag the red region)",
 }
 
@@ -40,7 +44,8 @@ class PeaksTab(QWidget):
         sideLayout = QVBoxLayout(side)
         params = QGroupBox("PeakFinder.process")
         paramLayout = QVBoxLayout(params)
-        self.form = ParamForm(dict(self.session.state["peaks"]), tooltips=PEAK_TOOLTIPS)
+        self.form = ParamForm(tooltips=PEAK_TOOLTIPS, toggles=PEAK_TOGGLES)
+        self.loadParams()
         self.form.changed.connect(self._formChanged)
         paramLayout.addWidget(self.form)
         self.findButton = QPushButton("Find peaks")
@@ -92,6 +97,9 @@ class PeaksTab(QWidget):
         splitter.setSizes([320, 1000])
 
     # ------------------------------------------------------------------
+    def loadParams(self):
+        self.form.setParams({**DEFAULT_PEAK_PARAMS, **self.session.state["peaks"]})
+
     def params(self):
         params = self.form.params()
         self.session.state["peaks"] = params
@@ -161,24 +169,36 @@ class PeaksTab(QWidget):
             plot.plot(x, y, pen=pg.mkPen(TOL["blue"], width=1))
             if peaks is not None:
                 p = peaks[peaks["detector"] == det]
-                if len(p):
-                    # pos is a positional index into the trace (see PeakFinder.process)
-                    plot.plot(x[np.clip(p["pos"].values, 0, len(x) - 1)], p["height"].values, pen=None,
-                              symbol="o", symbolSize=7, symbolBrush=TOL["purple"], symbolPen=None)
-                    for _, row in p.iterrows():
-                        x0 = x[0] + row["pos"] + row["width left"]
-                        x1 = x[0] + row["pos"] + row["width right"]
-                        h = row["height"] * widthFraction
-                        plot.plot([x0, x1], [h, h], pen=pg.mkPen(TOL["purple"], width=2))
-                        if np.isfinite(row.get("baseline left", np.nan)) and row.get("baseline left", 0) != 0:
-                            bl = int(row["pos"] + row["baseline left"])
-                            br = int(row["pos"] + row["baseline right"])
-                            if 0 <= bl < len(y) and 0 <= br < len(y):
-                                plot.plot([x[bl], x[br]], [y[bl], y[br]],
-                                          pen=pg.mkPen(TOL["green"], width=1, style=Qt.PenStyle.DashLine))
+                for _, row in p.iterrows():
+                    self._drawPeak(plot, x, y, row, widthFraction)
             if self.showRegions.isChecked():
                 self._addRegions(plot)
         self._placeRegions()
+
+    def _drawPeak(self, plot, x, y, row, widthFraction):
+        """Peak marker and width line; with a per-peak baseline also the baseline and the corrected trace."""
+        pos = int(np.clip(row["pos"], 0, len(y) - 1))  # positional index into the trace (see PeakFinder.process)
+        baseline = lambda k: 0.0  # noqa: E731
+        bl, br = row.get("baseline left", np.nan), row.get("baseline right", np.nan)
+        # NaN = baseline off, 0/0 = the walk found no baseline
+        if np.isfinite(bl) and np.isfinite(br) and not (bl == 0 and br == 0):
+            bl, br = int(pos + bl), int(pos + br)
+            if 0 <= bl < br < len(y):
+                slope = (y[br] - y[bl]) / (br - bl)
+                baseline = lambda k: y[bl] + slope * (np.asarray(k, dtype=float) - bl)  # noqa: E731
+                plot.plot([x[bl], x[br]], [y[bl], y[br]], pen=pg.mkPen(TOL["green"], width=1.5,
+                                                                      style=Qt.PenStyle.DashLine))
+                plot.plot([x[bl], x[br]], [y[bl], y[br]], pen=None, symbol="t1", symbolSize=8,
+                          symbolBrush=TOL["green"], symbolPen=None)
+                k = np.arange(bl, br + 1)
+                plot.plot(x[k], y[k] - baseline(k), pen=pg.mkPen(TOL["green"], width=1, style=Qt.PenStyle.DotLine))
+        # height is measured above the baseline: draw marker and width line on top of it
+        plot.plot([x[pos]], [baseline(pos) + row["height"]], pen=None, symbol="o", symbolSize=7,
+                  symbolBrush=TOL["purple"], symbolPen=None)
+        k0, k1 = pos + row["width left"], pos + row["width right"]
+        h = row["height"] * widthFraction
+        plot.plot([x[0] + k0, x[0] + k1], [baseline(k0) + h, baseline(k1) + h],
+                  pen=pg.mkPen(TOL["purple"], width=2))
 
     def _addRegions(self, plot):
         for key, color in (("roi", (68, 119, 170, 30)), ("noiseRegion", (238, 102, 119, 40))):

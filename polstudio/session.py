@@ -48,7 +48,10 @@ DEFAULT_STEPS = [
 
 DEFAULT_PEAK_PARAMS = {"threshold": 0.2, "peakNo": 1, "roi": [None, None], "distanceFactor": 2,
                        "widthFraction": 0.5, "symmetric": False, "minWidth": False, "slopeLength": False,
-                       "maxSlope": False, "noiseRegion": [0, 100]}
+                       "maxSlope": False, "slopeStartHeight": None, "noiseRegion": [0, 100]}
+
+# Peak arguments that are off via a sentinel and take a value when on: key -> (value when switched on, off value)
+PEAK_TOGGLES = {"slopeLength": (5, False), "maxSlope": (4.0, False), "slopeStartHeight": (0.5, None)}
 
 DEFAULT_POL_PARAMS = {"peakNo": 0, "beta": 2.0, "setPlin": None, "setPhi": None, "fitBeta": False,
                       "intMethod": "height", "useTransmission": True, "Ebind": 0.0}
@@ -77,6 +80,30 @@ def _jsonable(obj):
     return obj
 
 
+def runStepChain(data, steps, peakConfig=None, pulseEnergy=None, log=print):
+    """Apply the enabled preprocessing steps in order. Returns the PeakFinder."""
+    pf = PeakFinder(data, config=peakConfig)
+    for step in steps:
+        if not step.get("enabled"):
+            continue
+        name, params = step["name"], dict(step.get("params", {}))
+        if name == "filterByIntensity":
+            if pulseEnergy is None:
+                log("Skipping filterByIntensity: no GMD data")
+                continue
+            pf.filterByIntensity(pulseEnergy, **params)
+        elif name == "stack":
+            nTrains = len(np.unique(pf.data["trainId"].values))
+            if params.get("trainStackSize") and params["trainStackSize"] > nTrains:
+                params["trainStackSize"] = nTrains
+            pf.stack(**params)
+        elif name == "tShift":
+            pf.tShift(params.get("shift") or 0)
+        else:
+            getattr(pf, name)(**params)
+    return pf
+
+
 class AnalysisSession:
     def __init__(self, configPath=DEFAULT_CONFIG):
         self.configPath = Path(configPath)
@@ -86,10 +113,17 @@ class AnalysisSession:
         self.config.setdefault("FlashH5Loader", {})
         self.config.setdefault("PeakFinder", {})
         self.config.setdefault("Calibrate", {})
+        self._executor = None
+        self._executorWorkers = None
         self.state = self._defaultState()
         state = self.config.get(SESSION_KEY)
         if state:
-            self.state.update(copy.deepcopy(state))
+            state = copy.deepcopy(state)
+            # Keep defaults for parameters added after the session was saved
+            for key in ("peaks", "calibration", "polarization"):
+                if isinstance(state.get(key), dict):
+                    state[key] = {**self.state[key], **state[key]}
+            self.state.update(state)
         self.reset()
 
     # ------------------------------------------------------------------ state
@@ -108,6 +142,7 @@ class AnalysisSession:
                             "setBeta": 2.0, "setPhi": 0.0, "setPlin": 0.0, "intMethod": "height",
                             "file": None},
             "polarization": copy.deepcopy(DEFAULT_POL_PARAMS),
+            "workers": 0,                # worker processes per detector; 0 = auto, 1 = no pool
         }
 
     def reset(self):
@@ -125,6 +160,30 @@ class AnalysisSession:
         self.calibrationMeta = {}
         self.polarization = None   # dict with params / errors
         self.calibrateObj = None
+
+    def close(self):
+        """Release files and worker processes."""
+        self.reset()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+
+    def nWorkers(self):
+        from .parallel import defaultWorkers
+        nDet = self.raw.sizes["detector"] if self.raw is not None else 16
+        requested = int(self.state.get("workers") or 0)
+        return min(requested, nDet) if requested > 0 else defaultWorkers(nDet)
+
+    def executor(self):
+        """Persistent process pool (spawning workers costs a few seconds of imports, so reuse it)."""
+        from .parallel import makeExecutor
+        n = self.nWorkers()
+        if self._executor is None or self._executorWorkers != n:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+            self._executor = makeExecutor(n, _jsonable(self.config))
+            self._executorWorkers = n
+        return self._executor
 
     @property
     def loaderConfig(self):
@@ -200,28 +259,10 @@ class AnalysisSession:
         return data.isel(pulse=np.nonzero(mask)[0])
 
     def runSteps(self, data, steps=None, log=print):
-        """Apply the enabled preprocessing steps in order. Returns the PeakFinder."""
+        """Apply the enabled preprocessing steps in order (in this process). Returns the PeakFinder."""
         steps = steps if steps is not None else self.state["steps"]
-        pf = PeakFinder(data, config=self.config["PeakFinder"])
-        for step in steps:
-            if not step.get("enabled"):
-                continue
-            name, params = step["name"], dict(step.get("params", {}))
-            if name == "filterByIntensity":
-                if self.loader is None or self.loader.pulseEnergy is None:
-                    log("Skipping filterByIntensity: no GMD data")
-                    continue
-                pf.filterByIntensity(self.loader.pulseEnergy, **params)
-            elif name == "stack":
-                nTrains = len(np.unique(pf.data["trainId"].values))
-                if params.get("trainStackSize") and params["trainStackSize"] > nTrains:
-                    params["trainStackSize"] = nTrains
-                pf.stack(**params)
-            elif name == "tShift":
-                pf.tShift(params.get("shift") or 0)
-            else:
-                getattr(pf, name)(**params)
-        return pf
+        pulseEnergy = self.loader.pulseEnergy if self.loader is not None else None
+        return runStepChain(data, steps, self.config["PeakFinder"], pulseEnergy, log=log)
 
     def preview(self, trainIds, steps=None, log=print):
         """Run the step chain on a few trains only. Returns (rawSubset, processedSubset) in memory."""
@@ -230,8 +271,14 @@ class AnalysisSession:
         return rawSubset, pf.data.compute()
 
     def applySteps(self, log=print):
-        pf = self.runSteps(self.raw, log=log)
-        self.processed = pf.data.compute()
+        if self.raw is None:
+            raise ValueError("Load data first")
+        if self.nWorkers() > 1:
+            from . import parallel
+            log(f"Preprocessing {self.raw.sizes['detector']} detectors in {self.nWorkers()} worker processes")
+            self.processed = parallel.preprocess(self, self.executor(), self.state["steps"], log=log)
+        else:
+            self.processed = self.runSteps(self.raw, log=log).data.compute()
         self.peakFinder = None
         self.results = None
         return self.processed
@@ -245,8 +292,17 @@ class AnalysisSession:
             raise ValueError("Apply the preprocessing first")
         roi = params.get("roi") or [None, None]
         params["roi"] = [None if v in ("", None) else int(v) for v in roi]
+        # The baseline walk needs both slopeLength and maxSlope, but process() starts it when either is set
+        if (params.get("slopeLength") is False) != (params.get("maxSlope") is False):
+            missing = "slopeLength" if params.get("slopeLength") is False else "maxSlope"
+            params[missing] = PEAK_TOGGLES[missing][0]
+            print(f"Per-peak baseline: {missing} not set, using {params[missing]}")
         self.peakFinder = PeakFinder(data, config=self.config["PeakFinder"])
-        self.peakFinder.process(**params)
+        if self.nWorkers() > 1 and data.sizes["detector"] > 1:
+            from . import parallel
+            self.peakFinder.results = parallel.findPeaks(self, self.executor(), data, params)
+        else:
+            self.peakFinder.process(**params)
         self.results = self.enrichResults(self.peakFinder.results)
         self.peakFinder.results = self.results
         return self.results
@@ -285,7 +341,12 @@ class AnalysisSession:
 
     # ------------------------------------------------------------------ calibration
     def calibrationSettingsSnapshot(self):
-        return {k: _jsonable(self.loaderConfig.get(k)) for k in LOADER_KEYS_FOR_CALIBRATION}
+        snapshot = {k: _jsonable(self.loaderConfig.get(k)) for k in LOADER_KEYS_FOR_CALIBRATION}
+        cfg = self.loaderConfig
+        # Store the window actually used (null in the config means "full period")
+        snapshot["pulseWindow"] = FlashH5Loader.windowLength(float(cfg.get("pulsePeriod", 0.0)), cfg.get("pulseWindow"),
+                                                             int(cfg.get("nPulses", 1)), warn=False)
+        return snapshot
 
     def computeEnergyCalibration(self, peakNo=None, bindingEnergy=None):
         c = self.state["calibration"]

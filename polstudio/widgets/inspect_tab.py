@@ -1,9 +1,11 @@
 """Inspect raw train traces, tune the pulse split and look at the per-pulse GMD energy."""
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
                              QSlider, QSpinBox, QVBoxLayout, QWidget)
+
+from ToFPipeline import FlashH5Loader
 
 from .plot_grid import CYCLE, TOL
 
@@ -40,15 +42,14 @@ class InspectTab(QWidget):
 
         split = QGroupBox("Pulse split")
         splitLayout = QFormLayout(split)
-        cfg = self.session.loaderConfig
         self.offsetSpin = QDoubleSpinBox(decimals=2, maximum=1e6, singleStep=1.0)
-        self.offsetSpin.setValue(float(cfg.get("pulseOffset", 0.0)))
         self.periodSpin = QDoubleSpinBox(decimals=3, maximum=1e6, singleStep=0.1)
-        self.periodSpin.setValue(float(cfg.get("pulsePeriod", 1000.0)))
         self.nPulsesSpin = QSpinBox(minimum=1, maximum=1000)
-        self.nPulsesSpin.setValue(int(cfg.get("nPulses", 1)))
-        self.windowSpin = QSpinBox(minimum=1, maximum=1_000_000)
-        self.windowSpin.setValue(int(cfg.get("pulseWindow", 1000)))
+        # 0 = full period; the maximum follows floor(period) so windows cannot overlap
+        self.windowSpin = QSpinBox(minimum=0, maximum=1_000_000)
+        self.windowSpin.setSpecialValueText("full period")
+        self.windowSpin.setToolTip("Samples kept from each pulse start; the rest of the period is discarded")
+        self.loadSplitSettings(self.session.loaderConfig)
         for label, spin in (("first pulse offset", self.offsetSpin), ("period (samples)", self.periodSpin),
                             ("number of pulses", self.nPulsesSpin), ("window (samples)", self.windowSpin)):
             splitLayout.addRow(label, spin)
@@ -82,9 +83,27 @@ class InspectTab(QWidget):
         self._updateStartsLabel()
 
     # ------------------------------------------------------------------
+    def loadSplitSettings(self, cfg):
+        for spin in (self.offsetSpin, self.periodSpin, self.nPulsesSpin, self.windowSpin):
+            spin.blockSignals(True)
+        self.offsetSpin.setValue(float(cfg.get("pulseOffset", 0.0)))
+        self.periodSpin.setValue(float(cfg.get("pulsePeriod", 1000.0)))
+        self.nPulsesSpin.setValue(int(cfg.get("nPulses", 1)))
+        self._updateWindowMaximum()
+        self.windowSpin.setValue(int(cfg.get("pulseWindow") or 0))
+        for spin in (self.offsetSpin, self.periodSpin, self.nPulsesSpin, self.windowSpin):
+            spin.blockSignals(False)
+
+    def _nSamplesTrain(self):
+        return self._trace.sizes["sample"] if self._trace is not None else 16000
+
+    def _updateWindowMaximum(self):
+        self.windowSpin.setMaximum(FlashH5Loader.windowLength(self.periodSpin.value(), None,
+                                                              self.nPulsesSpin.value(), self._nSamplesTrain()))
+
     def splitSettings(self):
         return {"pulseOffset": self.offsetSpin.value(), "pulsePeriod": self.periodSpin.value(),
-                "nPulses": self.nPulsesSpin.value(), "pulseWindow": self.windowSpin.value()}
+                "nPulses": self.nPulsesSpin.value(), "pulseWindow": self.windowSpin.value() or None}
 
     def applySettingsToConfig(self):
         self.session.loaderConfig.update(self.splitSettings())
@@ -92,6 +111,7 @@ class InspectTab(QWidget):
     def onDataLoaded(self):
         tids = self.session.trainIds()
         self.trainSpin.setMaximum(max(len(tids) - 1, 0))
+        self._updateWindowMaximum()
         self.trainSlider.setMaximum(max(len(tids) - 1, 0))
         self.detectorCombo.blockSignals(True)
         current = self.detectorCombo.currentData()
@@ -120,20 +140,40 @@ class InspectTab(QWidget):
         self.trainChanged.emit(tid)
 
     def _splitChanged(self, *args):
+        self._updateWindowMaximum()
         self._updateStartsLabel()
         self.redraw()
 
     def _starts(self):
         s = self.splitSettings()
-        nSamples = self._trace.sizes["sample"] if self._trace is not None else 16000
+        nSamples = self._nSamplesTrain()
+        window = FlashH5Loader.windowLength(s["pulsePeriod"], s["pulseWindow"], s["nPulses"], nSamples, warn=False)
         starts = np.round(s["pulseOffset"] + np.arange(s["nPulses"]) * s["pulsePeriod"]).astype(int)
-        valid = (starts >= 0) & (starts + s["pulseWindow"] <= nSamples)
-        return starts, valid, s["pulseWindow"]
+        valid = (starts >= 0) & (starts + window <= nSamples)
+        return starts, valid, window
 
     def _updateStartsLabel(self):
-        starts, valid, _ = self._starts()
+        starts, valid, window = self._starts()
         text = ", ".join(str(s) if v else f"<s>{s}</s>" for s, v in zip(starts, valid))
-        self.startsLabel.setText(f"starts: {text}" + ("" if valid.all() else "<br>struck-out windows do not fit"))
+        text = f"starts: {text}" + ("" if valid.all() else "<br>struck-out windows do not fit")
+        nKept = int(valid.sum()) * window
+        text += (f"<br>kept {window} samples per pulse, {nKept} of {self._nSamplesTrain()} per train "
+                 f"({100 * nKept / self._nSamplesTrain():.0f} %)")
+        self.startsLabel.setText(text)
+
+    def _regionDragged(self, start, region):
+        lo, hi = region.getRegion()
+        for spin in (self.offsetSpin, self.windowSpin):
+            spin.blockSignals(True)
+        # Shift by the dragged distance so the fractional offset is kept (no drift when only the right edge moves)
+        self.offsetSpin.setValue(max(0.0, self.offsetSpin.value() + round(lo - start)))
+        window = int(round(hi - lo))
+        # windowSpin's maximum is floor(period): longer windows are capped; 0 shows as "full period"
+        self.windowSpin.setValue(window if window < self.windowSpin.maximum() else 0)
+        for spin in (self.offsetSpin, self.windowSpin):
+            spin.blockSignals(False)
+        # Rebuild the regions after the drag signal has returned
+        QTimer.singleShot(0, self._splitChanged)
 
     def redraw(self):
         self.trainPlot.clear()
@@ -155,7 +195,10 @@ class InspectTab(QWidget):
         for k, (s, v) in enumerate(zip(starts, valid)):
             color = pg.mkColor(CYCLE[k % len(CYCLE)]) if v else pg.mkColor("#999999")
             color.setAlpha(40)
-            region = pg.LinearRegionItem(values=(s, s + window), movable=False, brush=color)
+            # Drag a window to move all of them (offset), drag its edges to change the window length
+            region = pg.LinearRegionItem(values=(s, s + window), movable=bool(v), brush=color)
+            region.setToolTip("Drag to move all pulse windows, drag an edge to change the window length")
+            region.sigRegionChangeFinished.connect(lambda r, start=s: self._regionDragged(start, r))
             self.trainPlot.addItem(region)
             label = pg.TextItem(str(k), color=CYCLE[k % len(CYCLE)] if v else "#999999", anchor=(0, 0))
             label.setPos(s, float(np.nanmax(y)))

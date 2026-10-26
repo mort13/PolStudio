@@ -1,8 +1,10 @@
 """Left dock: choose a data folder, select runs/files, train range and channels."""
+import os
+
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import (QCheckBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                             QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QCheckBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                             QLineEdit, QPushButton, QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .params import fromText, toText
 
@@ -47,6 +49,16 @@ class DataPanel(QWidget):
         self.channelBoxes = {}
         layout.addWidget(channels)
         self._buildChannels(range(16))
+
+        workers = QFormLayout()
+        self.workersSpin = QSpinBox(minimum=0, maximum=os.cpu_count() or 1)
+        self.workersSpin.setSpecialValueText("auto")
+        self.workersSpin.setToolTip("Processes for 'Apply to all' and 'Find peaks', one detector each. "
+                                    "auto = min(detectors, CPU cores − 1); 1 = no extra processes.")
+        self.workersSpin.setValue(int(self.session.state.get("workers") or 0))
+        self.workersSpin.valueChanged.connect(lambda v: self.session.state.__setitem__("workers", v))
+        workers.addRow("worker processes", self.workersSpin)
+        layout.addLayout(workers)
 
         self.loadButton = QPushButton("Load selection")
         self.loadButton.setEnabled(False)

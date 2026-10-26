@@ -23,12 +23,21 @@ saved session, `--config <config.yaml>` uses another pipeline config (default `T
 | Step | Where | What happens |
 |---|---|---|
 | 1. Choose files | **Data** dock → *Open data folder…* | `FlashH5Loader.scan` lists every run (from `run<N>` in the file name) with its files, train count, trainId range, wavelength and start time. Tick runs/files, optionally restrict the trains (positional start/stop/step per file) and the ADC channels, then *Load selection*. |
-| 2. Inspect & split pulses | **Inspect** | Step through trains. The raw 16000-sample train trace is shown with the pulse windows shaded; below, all windows of that train are overlaid (aligned peaks = correct period) and the GMD energy per pulse. Pulse starts are `round(offset + k · period)` with a float period. *Apply split* re-cuts all loaded trains. |
+| 2. Inspect & split pulses | **Inspect** | Step through trains. The raw 16000-sample train trace is shown with the pulse windows shaded; below, all windows of that train are overlaid (aligned peaks = correct period) and the GMD energy per pulse. Pulse starts are `round(offset + k · period)` with a float period. Only the window (default: the full period, capped at `floor(period)` so windows never overlap) is kept; the rest of each period is discarded, which saves memory in proportion. *Apply split* re-cuts all loaded trains. |
 | 3. Preprocess | **Preprocess** | Enable, order (drag) and parametrise the `PeakFinder` steps: GMD/height filters, periodic-noise and FFT filters, tShift, stacking, smoothing, normalisation. *Preview* runs the chain on N trains starting at the train selected in Inspect (raw in grey, processed in blue). *Apply to all* processes the full selection. |
 | 4. Peaks | **Peaks** | `PeakFinder.process` parameters (ROI and noise region can be dragged on the plots). Traces with peak, FWHM and baseline markers, x axis in samples / ns / eV, the full results table and a position histogram. |
 | 5. Calibration | **Calibration** | Photon energy per run (from the wavelength channel, with overrides), energy calibration (needs ≥ 3 photon energies) and transmission coefficients via `Calibrate`. *Load / Save calibration* reads/writes JSON (default folder `results/calibrations/`). A loaded calibration is checked against the current pulse-split and shift settings. |
 | 6. Polarization | **Polarization** | `Fitter.pol` with optional transmission correction, and the `Plotter` polar intensity map of one pulse. |
 | 7. Save | *File → Save session…* (Ctrl+S) or *Quick save* | Writes a session folder (below). *File → Open session…* restores settings, peaks, calibration and processed traces; *Load selection* reloads the raw data. |
+
+## Parallel processing
+
+*Apply to all* and *Find peaks* run one detector per worker process (setting *worker processes* in the
+Data dock; auto = min(detectors, CPU cores − 1), 1 = everything in the GUI process). Each worker reads
+only its own ADC channel from the files, so decompression is parallel as well. `normalize` needs all
+detectors and runs in the main process between worker phases. The pool is started on first use (a few
+seconds) and reused. On a full run of the example data (14 detectors, 7 workers) preprocessing took
+16 s instead of 61 s and peak finding on unstacked data 7 s instead of 15 s.
 
 ## Session folder
 

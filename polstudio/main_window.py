@@ -336,21 +336,19 @@ class MainWindow(QMainWindow):
 
     def setSession(self, session):
         if self.session is not None and self.session is not session:
-            self.session.reset()
+            self.session.close()
         self.session = session
         for widget in (self.dataPanel, self.inspectTab, self.preprocessTab, self.peaksTab, self.calibrationTab,
                        self.polarizationTab):
             widget.session = session
-        cfg = session.loaderConfig
-        self.inspectTab.offsetSpin.setValue(float(cfg.get("pulseOffset", 0.0)))
-        self.inspectTab.periodSpin.setValue(float(cfg.get("pulsePeriod", 1000.0)))
-        self.inspectTab.nPulsesSpin.setValue(int(cfg.get("nPulses", 1)))
-        self.inspectTab.windowSpin.setValue(int(cfg.get("pulseWindow", 1000)))
+        self.inspectTab.loadSplitSettings(session.loaderConfig)
+        self.inspectTab._updateStartsLabel()
+        self.dataPanel.workersSpin.setValue(int(session.state.get("workers") or 0))
         for key, edit in self.dataPanel.trainEdits.items():
             value = session.state.get(key)
             edit.setText("" if value is None else str(value))
         self.preprocessTab.loadSteps()
-        self.peaksTab.form.setParams(dict(session.state["peaks"]))
+        self.peaksTab.loadParams()
         self.calibrationTab.reloadSettings()
         self.polarizationTab.reloadSettings()
         self.onProcessedChanged()
@@ -366,5 +364,5 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.session is not None:
-            self.session.reset()
+            self.session.close()
         super().closeEvent(event)
