@@ -1,0 +1,12 @@
+numpy
+scipy
+pandas
+xarray>=2023.08
+dask
+h5py
+hdf5plugin
+matplotlib
+pyyaml
+tqdm
+PyQt6
+pyqtgraph
